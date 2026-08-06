@@ -72,9 +72,9 @@ def get_tolerance(order_value: Number, survey_value: Number) -> Status:
 
     delta = abs(float(order_value) - float(survey_value))  # type: ignore[arg-type]
 
-    if delta <= OK_MAX_MM:
+    if delta < OK_MAX_MM:
         return "ok"
-    if delta <= WARN_MAX_MM:
+    if delta < WARN_MAX_MM:
         return "warn"
     return "danger"
 
@@ -129,8 +129,8 @@ def classify_tolerance(
     if _is_missing(delta_mm):
         return "grey"
     d = abs(float(delta_mm))  # type: ignore[arg-type]
-    if d <= green_mm:
+    if d < green_mm:
         return "green"
-    if d <= amber_mm:
+    if d < amber_mm:
         return "amber"
     return "red"
