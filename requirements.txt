@@ -1,0 +1,20 @@
+# WCS Survey Editor — pinned for deployment (05-Aug-2026)
+#
+# starlette<1.4 is a HARD REQUIREMENT, not a preference.
+# Starlette 1.4.0 added a required keyword-only argument
+# (thread_minimum_size) to GZipResponder.__init__. Streamlit's
+# starlette_gzip_middleware subclasses GZipResponder and does not pass it,
+# so the server dies on startup with:
+#     TypeError: GZipResponder.__init__() missing 1 required
+#                keyword-only argument: 'thread_minimum_size'
+# The app never renders — you just get a blank browser tab.
+# Tracked upstream at streamlit/streamlit issue #16341.
+# Remove this pin only after Streamlit ships a fix.
+
+streamlit>=1.53,<1.62
+starlette<1.4
+
+pymupdf>=1.24.0
+pandas>=2.2.0
+openpyxl>=3.1.2
+pillow>=10.0.0
