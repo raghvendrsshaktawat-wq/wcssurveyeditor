@@ -91,9 +91,9 @@ def _cell_highlight(order_val, survey_val) -> str:
         diff = abs(float(order_val) - float(survey_val))
     except (TypeError, ValueError):
         return ""
-    if diff > TOL_DANGER_MM:
+    if diff >= TOL_DANGER_MM:
         return _HL_DANGER
-    if diff > TOL_WARN_MM:
+    if diff >= TOL_WARN_MM:
         return _HL_WARN
     return ""  # within tolerance -> plain
 
