@@ -224,6 +224,24 @@ def render_sketch_dialog_if_open() -> None:
         return
 
     file_key, sales_line, subtitle, order_no = target
+
+    # Mobile: expand the sketch dialog to fill the screen so the canvas is
+    # usable on a phone (reported too small). Media-query gated at 768px, so
+    # desktop/laptop are completely unaffected.
+    st.markdown(
+        """<style>
+        @media (max-width: 768px) {
+          div[data-testid="stDialog"] > div,
+          div[data-testid="stDialog"] div[role="dialog"] {
+            width: 100vw !important; max-width: 100vw !important;
+            height: 100dvh !important; max-height: 100dvh !important;
+            margin: 0 !important; border-radius: 0 !important;
+          }
+        }
+        </style>""",
+        unsafe_allow_html=True,
+    )
+
     deco = _dialog(f"✏️  Site Sketch — Sales Line {sales_line}")
 
     def _body() -> None:
