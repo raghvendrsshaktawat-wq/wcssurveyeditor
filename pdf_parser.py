@@ -107,6 +107,62 @@ SALES_LINE_RE = re.compile(r"^\s*(0\d{3})\s*$")
 # Fixed literal that appears on the line *immediately after* the sales-line.
 QTY_LITERAL = "1"
 
+# ---- Glass-to-Glass (G2G) windows -------------------------------------------
+# A G2G opening is ONE sales line but always TWO width-facets sharing one
+# height. Its sizes are NOT in the standard size slot -- they live in the spec
+# block as "Facet I Width / Facet II Width / Facet Height". We detect it,
+# recover those sizes, and emit two facet rows each carrying its own order
+# size (so G2G facets get tolerance colouring like any ordinary opening).
+G2G_DESC_RE = re.compile(r"\bG2G\b|Glass\s*To\s*Glass", re.IGNORECASE)
+
+# Bay windows: "Bay 2 Facet" / "Bay 3 Facet". Kept as a SINGLE overall row at
+# parse time; the UI dropdown splits it into facet rows on demand. bay_facets
+# is what triggers that dropdown in main.render_bay_facet_controls().
+BAY_FACET_RE = re.compile(r"\bBay\s*(\d+)\s*Facet\b", re.IGNORECASE)
+
+
+def _bay_facets(description: str) -> int:
+    if not description:
+        return 0
+    m = BAY_FACET_RE.search(description)
+    if not m:
+        return 0
+    try:
+        n = int(m.group(1))
+        return n if 2 <= n <= 6 else 0
+    except ValueError:
+        return 0
+G2G_FACET_LABEL = "Facet I Width"
+_G2G_INT_RE = re.compile(r"^\d{3,4}$")
+
+
+def _is_g2g(description: str) -> bool:
+    return bool(description) and bool(G2G_DESC_RE.search(description))
+
+
+def _extract_g2g_dims(lines, sales_idx):
+    """Recover (facet_I_w, facet_II_w, facet_h) for a G2G opening, else None."""
+    end = min(sales_idx + 80, len(lines))
+    label_idx = None
+    for j in range(sales_idx, end):
+        if lines[j].strip() == G2G_FACET_LABEL:
+            label_idx = j
+            break
+    if label_idx is None:
+        return None
+    run = []
+    for j in range(label_idx, min(label_idx + 60, len(lines))):
+        s = lines[j].strip()
+        if _G2G_INT_RE.match(s):
+            run.append(int(s))
+            if len(run) >= 3:
+                break
+        elif run:
+            if len(run) >= 3:
+                break
+            run = []
+    return (run[0], run[1], run[2]) if len(run) >= 3 else None
+
 # Order dimension: 3–4 digit number on its own line (mm).
 # Layout note: this PDF prints WIDTH first, then HEIGHT (header says "Size (w x h)").
 DIMENSION_RE = re.compile(r"^\s*(\d{3,4})\s*$")
@@ -415,12 +471,19 @@ def _extract_rows(lines: list[str]) -> list[dict[str, Any]]:
         order_height = _match_dim(lines[w_idx]) if w_idx is not None else None
         order_width = _match_dim(lines[h_idx]) if h_idx is not None else None
 
-        if order_width is None or order_height is None:
-            i += 1
-            continue
-
         # Description via LOOKBACK from the sales-line (skip numeric/boilerplate).
         description = _lookback_description(lines, i)
+
+        if order_width is None or order_height is None:
+            # G2G has no size in the standard slot -- accept it (sizes recovered
+            # from the spec block below); ordinary size-less lines still bail.
+            if not _is_g2g(description or ""):
+                i += 1
+                continue
+            order_width = None
+            order_height = None
+
+        g2g_dims = _extract_g2g_dims(lines, i) if _is_g2g(description or "") else None
 
         # Reference / Location / System — locked onto the "Arch Height(mm)"
         # anchor first (mirrors the original v4.2 parser), THEN collected as
@@ -472,6 +535,8 @@ def _extract_rows(lines: list[str]) -> list[dict[str, Any]]:
             "reference":     reference,     # e.g. "W1"
             "location":      location,      # e.g. "Bedroom abv 29F"
             "subfields_missing": subfields_missing,  # True => needs manual check
+            "bay_facets":    _bay_facets(description),  # 0, or 2-3 for a bay
+            "g2g_dims":      g2g_dims,      # (w1, w2, h) or None
             # Empty placeholders — filled in by the survey UI later
             "survey_width":  None,
             "survey_height": None,
@@ -559,8 +624,36 @@ def _collect_indented_values(
 
 # -------- Top-level implementation entry -------------------------------------
 
+def _expand_g2g(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Split each G2G line into 2 facet rows with per-facet order sizes.
+    Ordinary and bay lines pass through completely unchanged."""
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        desc = str(r.get("description") or "").strip()
+        if not _is_g2g(desc):
+            out.append(r)
+            continue
+        dims = r.get("g2g_dims")
+        w1 = w2 = h = None
+        if dims and len(dims) == 3:
+            w1, w2, h = dims
+        for k, fw in ((1, w1), (2, w2)):
+            fr = dict(r)
+            fr["description"] = f"{desc} - Facet {k}" if desc else f"Facet {k}"
+            fr["facet_no"] = k
+            fr["facet_total"] = 2
+            fr["order_width"] = fw
+            fr["order_height"] = h
+            fr["survey_width"] = None
+            fr["survey_height"] = None
+            fr.pop("g2g_dims", None)
+            out.append(fr)
+    return out
+
+
 def _parse_impl(file_bytes: bytes) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     lines = _extract_lines(file_bytes)
     metadata = _extract_metadata(lines)
     rows = _extract_rows(lines)
+    rows = _expand_g2g(rows)
     return metadata, rows
