@@ -24,6 +24,7 @@ from typing import Any
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from pdf_parser import parse_survey_pdf
 from overlay import overlay_survey_data
@@ -91,10 +92,9 @@ def _cell_highlight(order_val, survey_val) -> str:
         diff = abs(float(order_val) - float(survey_val))
     except (TypeError, ValueError):
         return ""
-    if diff >= TOL_DANGER_MM:
-        return _HL_DANGER
+    # Single-indication policy: any diff >= 75 mm is RED. Amber retired.
     if diff >= TOL_WARN_MM:
-        return _HL_WARN
+        return _HL_DANGER
     return ""  # within tolerance -> plain
 
 
@@ -319,6 +319,23 @@ STATUS_LABEL = {
 }
 EDIT_COLUMNS = ("survey_width", "survey_height", "room", "remarks")
 
+# ---- Three-measurement capture (SOP mode) -----------------------------------
+# In "Three measurements" mode the surveyor records 3 widths + 3 heights per
+# opening; the app takes the SMALLEST of each and deducts a silicon tolerance
+# to produce the production size (which is what survey_width/survey_height mean
+# throughout this app). These six columns are editable in that mode and
+# persisted across reruns like any other edit.
+MEASURE_W_COLS = ("meas_w1", "meas_w2", "meas_w3")
+MEASURE_H_COLS = ("meas_h1", "meas_h2", "meas_h3")
+MEASURE_COLUMNS = MEASURE_W_COLS + MEASURE_H_COLS
+
+# Everything that must survive a rerun (direct-entry fields + the 6 measurements)
+RESTORE_COLUMNS = EDIT_COLUMNS + MEASURE_COLUMNS
+
+DEFAULT_SILICON_MM = 8
+MODE_DIRECT = "Direct entry"
+MODE_THREE = "Three measurements (min − silicon)"
+
 
 # =============================================================================
 # Header, legend, sidebar
@@ -349,10 +366,7 @@ def render_legend() -> None:
         """
         <div class="wcs-legend">
             <div class="legend-item">
-                <span class="chip chip-warn">&gt; 75 mm</span> review
-            </div>
-            <div class="legend-item">
-                <span class="chip chip-danger">&gt; 200 mm</span> critical
+                <span class="chip chip-danger">&ge; 75 mm</span> out of tolerance
             </div>
         </div>
         """,
@@ -380,7 +394,10 @@ def render_sidebar() -> None:
         )
 
         st.markdown("---")
-        st.caption("Highlight thresholds  ·  > 75 mm review  ·  > 200 mm critical")
+        st.caption(
+            "Size-capture mode is chosen at the top of each order.  ·  "
+            "Highlight: deviation ≥ 75 mm shows red."
+        )
 
         if st.button("Clear all uploads & edits", use_container_width=True):
             for k in list(st.session_state.keys()):
@@ -417,6 +434,19 @@ def _safe(value: Any) -> str:
         return "—"
     s = str(value).strip()
     return s if s else "—"
+
+
+def _output_basename(order_no: str) -> str:
+    """
+    Download filename stem: order number, plus the Project / Lot name from the
+    sidebar appended when the surveyor has entered one.
+    e.g. order 'W9042901' + lot 'Tower3_L34' -> 'W9042901_Tower3_L34'.
+    """
+    base = order_no if (order_no and order_no != "—") else "order"
+    lot = _sanitize_sheet_name(
+        st.session_state.get("project_name", "") or "", fallback=""
+    )
+    return f"{base}_{lot}" if lot else base
 
 
 def _sanitize_sheet_name(name: str, fallback: str) -> str:
@@ -498,13 +528,27 @@ def rows_to_dataframe(rows: list[dict[str, Any]]) -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
 
+    if "facet_no" not in df.columns:
+        df["facet_no"] = 0
+    df["facet_no"] = df["facet_no"].fillna(0)
+    if "facet_total" not in df.columns:
+        df["facet_total"] = 0
+    df["facet_total"] = df["facet_total"].fillna(0)
+
     # Ensure edit columns exist even if the parser omitted them
     for col in EDIT_COLUMNS:
         if col not in df.columns:
             df[col] = None if "width" in col or "height" in col else ""
 
+    # Three-measurement columns — always present so the mode can toggle without
+    # rebuilding the frame; blank until the surveyor fills them.
+    for col in MEASURE_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+
     # Coerce numeric columns for the editor
-    for col in ("order_width", "order_height", "survey_width", "survey_height"):
+    for col in ("order_width", "order_height", "survey_width", "survey_height",
+                *MEASURE_COLUMNS):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -523,6 +567,47 @@ def rows_to_dataframe(rows: list[dict[str, Any]]) -> pd.DataFrame:
     df["subfields_missing"] = df["subfields_missing"].fillna(False).astype(bool)
     df["flag"] = df["subfields_missing"].apply(lambda m: "⚠ Check" if m else "")
 
+    return df
+
+
+def _min_measurement(values: list[Any]) -> float | None:
+    """Smallest positive numeric measurement, or None if none are entered."""
+    nums = []
+    for v in values:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if f == f and f > 0:          # exclude NaN and non-positive
+            nums.append(f)
+    return min(nums) if nums else None
+
+
+def _compute_production_sizes(df: pd.DataFrame, silicon_mm: int) -> pd.DataFrame:
+    """
+    In three-measurement mode, derive survey_width / survey_height from the six
+    measurement columns: smallest of the three, minus the silicon tolerance
+    (never below 0).
+
+    KEEP-BOTH (Q2): if a dimension has NO measurements entered yet, the
+    existing survey value is preserved — so a surveyor who typed sizes in
+    Direct mode and then switches to Three-measurement does NOT lose them.
+    The computed value only overwrites once at least one measurement for that
+    dimension is present. Returns the same frame (edited in place).
+    """
+    if df is None or df.empty:
+        return df
+
+    def _prod(row: pd.Series, cols, existing_col: str) -> Any:
+        m = _min_measurement([row.get(c) for c in cols])
+        if m is None:
+            return row.get(existing_col)          # keep existing (e.g. direct)
+        return max(0, int(round(m - silicon_mm)))
+
+    df["survey_width"] = df.apply(
+        lambda r: _prod(r, MEASURE_W_COLS, "survey_width"), axis=1)
+    df["survey_height"] = df.apply(
+        lambda r: _prod(r, MEASURE_H_COLS, "survey_height"), axis=1)
     return df
 
 
@@ -573,14 +658,67 @@ def render_data_editor(
     df: pd.DataFrame,
     key: str,
     sketched: set[str] | None = None,
+    mode: str = MODE_DIRECT,
 ) -> pd.DataFrame:
-    # Only the requested columns, in the requested order. Everything else
-    # (system, status, flag) stays hidden for a minimal view.
-    column_order = [c for c in GRID_COLUMN_ORDER if c in df.columns]
+    three = (mode == MODE_THREE)
+
+    # Column order depends on the capture mode. Direct: type Survey W/H.
+    # Three-measurement: enter W1-3 / H1-3, with the computed Prod W/H shown
+    # read-only beside them.
+    if three:
+        column_order = [
+            "sales_line", "description", "order_width", "order_height",
+            "reference", "location",
+            "meas_w1", "meas_w2", "meas_w3",
+            "meas_h1", "meas_h2", "meas_h3",
+            "survey_width", "survey_height",
+            "room", "remarks",
+        ]
+    else:
+        column_order = list(GRID_COLUMN_ORDER)
+    column_order = [c for c in column_order if c in df.columns]
 
     # Conditional formatting on the read-only cells: Order W / Order H by
     # tolerance, Sales Line by sketch status.
     styled = df.style.apply(_build_row_styles, axis=None, sketched=sketched)
+
+    # Autofit (#6): width=None lets Streamlit size each column to its content.
+    def _mnum(label: str, disabled: bool = False, help: str | None = None):
+        return st.column_config.NumberColumn(
+            label, format="%d", width=None, min_value=0, max_value=9999,
+            disabled=disabled, help=help,
+        )
+
+    column_config = {
+        "sales_line":    st.column_config.TextColumn(
+            "Sales Line", disabled=True, width=None,
+            help="Green = site sketch saved · Grey = sketch pending. "
+                 "Use the Sketch rail on the right to draw."),
+        "description":   st.column_config.TextColumn("Config",     disabled=True, width=None),
+        "order_width":   _mnum("Order W", disabled=True),
+        "order_height":  _mnum("Order H", disabled=True),
+        "reference":     st.column_config.TextColumn("Reference", disabled=True, width=None),
+        "location":      st.column_config.TextColumn("Location",  disabled=True, width=None),
+        "room":          st.column_config.TextColumn("Room", width=None),
+        "remarks":       st.column_config.TextColumn("Remarks", width=None),
+    }
+
+    if three:
+        # Six editable measurement columns + computed Prod W/H (read-only,
+        # live in the grid).
+        column_config.update({
+            "meas_w1": _mnum("W-1"), "meas_w2": _mnum("W-2"), "meas_w3": _mnum("W-3"),
+            "meas_h1": _mnum("H-1"), "meas_h2": _mnum("H-2"), "meas_h3": _mnum("H-3"),
+            "survey_width":  _mnum("Prod W", disabled=True,
+                help="Smallest of W-1/2/3 minus silicon tolerance."),
+            "survey_height": _mnum("Prod H", disabled=True,
+                help="Smallest of H-1/2/3 minus silicon tolerance."),
+        })
+    else:
+        column_config.update({
+            "survey_width":  _mnum("Survey W"),
+            "survey_height": _mnum("Survey H"),
+        })
 
     edited = st.data_editor(
         styled,
@@ -590,25 +728,7 @@ def render_data_editor(
         column_order=column_order,
         num_rows="fixed",
         height=GRID_HEIGHT_PX,
-        column_config={
-            "sales_line":    st.column_config.TextColumn(
-                "Sales Line", disabled=True, width="small",
-                help="Green = site sketch saved · Grey = sketch pending. "
-                     "Use the Sketch rail on the right to draw."),
-            "description":   st.column_config.TextColumn("Config",     disabled=True, width="medium"),
-            "order_width":   st.column_config.NumberColumn("Order W", disabled=True, format="%d", width="small"),
-            "order_height":  st.column_config.NumberColumn("Order H", disabled=True, format="%d", width="small"),
-            "reference":     st.column_config.TextColumn("Reference", disabled=True, width="small"),
-            "location":      st.column_config.TextColumn("Location",  disabled=True, width="medium"),
-            "survey_width":  st.column_config.NumberColumn(
-                "Survey W", format="%d", width="small",
-                min_value=0, max_value=9999),
-            "survey_height": st.column_config.NumberColumn(
-                "Survey H", format="%d", width="small",
-                min_value=0, max_value=9999),
-            "room":          st.column_config.TextColumn("Room", width="medium"),
-            "remarks":       st.column_config.TextColumn("Remarks", width="large"),
-        },
+        column_config=column_config,
     )
 
     # ---- Clean the returned frame -----------------------------------------
@@ -643,8 +763,7 @@ def render_tolerance_metrics(counts: dict[str, int], total: int) -> None:
         f"""
         <div class="wcs-chip-row">
             <span class="wcs-chip green"><span class="chip-dot"></span>OK <span class="chip-val">{counts['ok']}</span></span>
-            <span class="wcs-chip amber"><span class="chip-dot"></span>Review <span class="chip-val">{counts['warn']}</span></span>
-            <span class="wcs-chip red"><span class="chip-dot"></span>Critical <span class="chip-val">{counts['danger']}</span></span>
+            <span class="wcs-chip red"><span class="chip-dot"></span>Out of tolerance (&ge;75mm) <span class="chip-val">{counts['danger'] + counts['warn']}</span></span>
             <span class="wcs-chip blue"><span class="chip-dot"></span>Not measured <span class="chip-val">{counts['empty']}</span></span>
             <span class="wcs-chip grey">Surveyed <span class="chip-val">{pct}</span> of {total}</span>
         </div>
@@ -693,11 +812,14 @@ def render_sketch_rail(
         unsafe_allow_html=True,
     )
 
+    seen_codes: set[str] = set()
+
     with st.container(height=GRID_HEIGHT_PX - _RAIL_HEADER_PX, border=True):
         for i, row in enumerate(rows):
             code = str(row.get("sales_line") or "").strip()
-            if not code:
+            if not code or code in seen_codes:
                 continue
+            seen_codes.add(code)
             done = code in sketched
 
             if st.button(
@@ -750,6 +872,99 @@ def render_sketch_progress(done: int, total: int, nbytes: int = 0) -> None:
 # =============================================================================
 # Per-file processing
 # =============================================================================
+def _bay_choice_key(editor_key: str, sales_line: str) -> str:
+    return f"bayfacets_{editor_key}_{sales_line}"
+
+
+def render_bay_facet_controls(rows: list[dict[str, Any]], editor_key: str) -> None:
+    bays = [
+        r for r in rows
+        if int(r.get("bay_facets") or 0) >= 2 and str(r.get("sales_line") or "").strip()
+    ]
+    if not bays:
+        return
+    with st.expander(
+        f"\U0001FA9F Bay windows ({len(bays)}) \u2014 record overall, or split into facets?",
+        expanded=False,
+    ):
+        st.caption(
+            "Bay windows are one sales line coupled from several facets. Leave "
+            "as **Overall** to record one size (tolerance-checked), or split into "
+            "facets to capture each facet's W\u00d7H (no tolerance colour)."
+        )
+        cols = st.columns(min(3, len(bays)))
+        for i, r in enumerate(bays):
+            sl = str(r["sales_line"]).strip()
+            n = int(r.get("bay_facets") or 2)
+            options = ["Overall (1 row)"] + [f"{k} facets" for k in range(2, n + 1)]
+            with cols[i % len(cols)]:
+                st.selectbox(
+                    f"Line {sl} \u00b7 {str(r.get('description') or '').strip()}",
+                    options, index=0, key=_bay_choice_key(editor_key, sl),
+                    help=f"{r.get('location') or 'Bay opening'} \u00b7 order "
+                         f"{_safe(r.get('order_width'))} x {_safe(r.get('order_height'))} mm",
+                )
+
+
+def _apply_bay_split(rows: list[dict[str, Any]], editor_key: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        n_bay = int(r.get("bay_facets") or 0)
+        if n_bay < 2:
+            out.append(r)
+            continue
+        sl = str(r.get("sales_line") or "").strip()
+        choice = st.session_state.get(_bay_choice_key(editor_key, sl), "")
+        m = re.match(r"(\d+)\s+facets", str(choice))
+        k = int(m.group(1)) if m else 1
+        if k < 2:
+            out.append(r)
+            continue
+        base_desc = str(r.get("description") or "").strip()
+        for f in range(1, k + 1):
+            fr = dict(r)
+            fr["description"] = f"{base_desc} - Facet {f}" if base_desc else f"Facet {f}"
+            fr["facet_no"] = f
+            fr["facet_total"] = k
+            fr["order_width"] = None
+            fr["order_height"] = None
+            fr["survey_width"] = None
+            fr["survey_height"] = None
+            out.append(fr)
+    return out
+
+
+def _restore_edits(df_source: pd.DataFrame, saved: Any) -> None:
+    if not isinstance(saved, pd.DataFrame) or saved.empty:
+        return
+
+    def _fno(v: Any) -> int:
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 0
+
+    sv = saved.copy()
+    if "facet_no" not in sv.columns:
+        sv["facet_no"] = 0
+    sv["_k"] = list(zip(
+        sv["sales_line"].astype(str).str.strip(),
+        sv["facet_no"].map(_fno),
+    ))
+    lookup = {k: idx for idx, k in zip(sv.index, sv["_k"])}
+    fno_src = df_source["facet_no"].map(_fno) if "facet_no" in df_source.columns \
+        else pd.Series(0, index=df_source.index)
+    for pos, (sl, fno) in enumerate(zip(
+        df_source["sales_line"].astype(str).str.strip(), fno_src
+    )):
+        sidx = lookup.get((sl, fno))
+        if sidx is None:
+            continue
+        for col in RESTORE_COLUMNS:
+            if col in sv.columns and col in df_source.columns:
+                df_source.iloc[pos, df_source.columns.get_loc(col)] = sv.at[sidx, col]
+
+
 def process_file(file, idx: int) -> dict[str, Any]:
     """
     Parse one file, render its expander UI, return a small result dict for the
@@ -758,6 +973,7 @@ def process_file(file, idx: int) -> dict[str, Any]:
     empty_result = {
         "name": file.name,
         "total": 0,
+        "openings": 0,
         "counts": {s: 0 for s in STATUSES},
         "df": pd.DataFrame(columns=EXPECTED_COLS),
         "metadata": {},
@@ -785,12 +1001,48 @@ def process_file(file, idx: int) -> dict[str, Any]:
 
     order_no = _safe(metadata.get("order_number"))
     total_rows = len(rows)
-    title = (
-        f"📄 {file.name}  ·  Order {order_no}  ·  "
-        f"{total_rows} opening{'s' if total_rows != 1 else ''}"
+    # An OPENING is one physical window (one sales line). A bay split into
+    # facets, or a G2G's two facet rows, is still ONE opening.
+    openings = len({
+        str(r.get("sales_line") or "").strip()
+        for r in rows if str(r.get("sales_line") or "").strip()
+    })
+
+    # Full-width header (no expander) so the grid gets the whole page and never
+    # needs the fullscreen button — which is what used to drop three-measurement
+    # mode out of fullscreen when the 2nd size was typed.
+    st.markdown(
+        f'<div class="section-title" style="font-size:1.05rem;margin-top:2px">'
+        f'📄 {file.name} &nbsp;·&nbsp; Order {order_no} &nbsp;·&nbsp; '
+        f'{openings} opening{"s" if openings != 1 else ""}</div>',
+        unsafe_allow_html=True,
     )
 
-    with st.expander(title, expanded=(idx == 0)):
+    # ---- Size-capture mode — chosen per order, at the top (C1/C2) ----------
+    # Per-session (= per-order = per-surveyor); each surveyor's session is
+    # independent, so one surveyor's choice never affects another.
+    mc1, mc2 = st.columns([3, 1])
+    with mc1:
+        st.radio(
+            "Size capture",
+            options=[MODE_DIRECT, MODE_THREE],
+            index=0 if st.session_state.get("measure_mode", MODE_DIRECT) == MODE_DIRECT else 1,
+            key="measure_mode",
+            horizontal=True,
+            help=("Direct: type the production W/H straight in.  ·  "
+                  "Three measurements: enter 3 widths + 3 heights; the app takes "
+                  "the smallest of each minus the silicon tolerance."),
+        )
+    with mc2:
+        if st.session_state.get("measure_mode") == MODE_THREE:
+            st.number_input(
+                "Silicon (mm)", min_value=0, max_value=50,
+                value=int(st.session_state.get("silicon_mm", DEFAULT_SILICON_MM)),
+                step=1, key="silicon_mm",
+                help="Deducted from the smallest of the three measurements.",
+            )
+
+    with st.container(border=True):
         render_metadata(metadata)
 
         # ---- Zero-rows guard (Module 6) -----------------------------------
@@ -807,14 +1059,23 @@ def process_file(file, idx: int) -> dict[str, Any]:
         editor_key = (
             f"edited_{file.file_id if hasattr(file, 'file_id') else file.name}"
         )
-        df_source = rows_to_dataframe(rows)
+        render_bay_facet_controls(rows, editor_key)
+        rows_final = _apply_bay_split(rows, editor_key)
+        df_source = rows_to_dataframe(rows_final)
 
-        # Preserve prior edits across reruns
+        # Preserve prior edits across reruns — keyed on (sales_line, facet_no).
         saved = st.session_state.get(editor_key + "_df")
-        if isinstance(saved, pd.DataFrame) and len(saved) == len(df_source):
-            for col in EDIT_COLUMNS:
-                if col in saved.columns:
-                    df_source[col] = saved[col].values
+        _restore_edits(df_source, saved)
+
+        # Capture mode (global, from the sidebar).
+        measure_mode = st.session_state.get("measure_mode", MODE_DIRECT)
+        silicon_mm = int(st.session_state.get("silicon_mm", DEFAULT_SILICON_MM))
+
+        # In three-measurement mode, derive production sizes from the restored
+        # measurements BEFORE rendering, so the grid shows current Prod W/H.
+        if measure_mode == MODE_THREE:
+            _compute_production_sizes(df_source, silicon_mm)
+            df_source["status"] = df_source.apply(_row_status, axis=1)
 
         # Sketch state is read ONCE per run and passed down, so neither the
         # grid styler nor the rail hits session_state per row.
@@ -824,8 +1085,13 @@ def process_file(file, idx: int) -> dict[str, Any]:
         ] if "sales_line" in df_source.columns else []
         sketched = sketch.drawn_set(editor_key, sales_lines)
 
+        grid_hint = (
+            "enter 3 widths + 3 heights — Prod W/H is computed"
+            if measure_mode == MODE_THREE
+            else "enter Survey W/H, Room, Remarks"
+        )
         st.markdown(
-            '<div class="section-title grid-title">✎ Survey Grid — enter Survey W/H, Room, Remarks</div>',
+            f'<div class="section-title grid-title">✎ Survey Grid — {grid_hint}</div>',
             unsafe_allow_html=True,
         )
 
@@ -837,10 +1103,17 @@ def process_file(file, idx: int) -> dict[str, Any]:
 
         with grid_col:
             edited_df = render_data_editor(
-                df_source, key=editor_key, sketched=sketched,
+                df_source, key=editor_key, sketched=sketched, mode=measure_mode,
             )
         with rail_col:
             render_sketch_rail(df_source, editor_key, order_no, sketched)
+
+        # Recompute production sizes from the surveyor's LATEST measurements so
+        # tolerance counts, the PDF overlay and Excel all use current values.
+        if measure_mode == MODE_THREE:
+            _compute_production_sizes(edited_df, silicon_mm)
+            if "status" in edited_df.columns:
+                edited_df["status"] = edited_df.apply(_row_status, axis=1)
 
         st.session_state[editor_key + "_df"] = edited_df
 
@@ -888,19 +1161,50 @@ def process_file(file, idx: int) -> dict[str, Any]:
 
         annotated_bytes = st.session_state.get(editor_key + "_pdf")
         if annotated_bytes:
-            fname = f"annotated_{order_no if order_no != '—' else 'order'}.pdf"
-            st.download_button(
-                label=f"📥 Download {fname}",
-                data=annotated_bytes,
-                file_name=fname,
-                mime="application/pdf",
-                key=f"dl_{editor_key}",
-                use_container_width=True,
-            )
+            base = _output_basename(order_no)   # order no + lot name (if any)
+            dl_pdf, dl_xl = st.columns(2)
+            with dl_pdf:
+                st.download_button(
+                    label="📥 Download PDF",
+                    data=annotated_bytes,
+                    file_name=f"annotated_{base}.pdf",
+                    mime="application/pdf",
+                    key=f"dl_{editor_key}",
+                    use_container_width=True,
+                    help=f"annotated_{base}.pdf",
+                )
+            with dl_xl:
+                single_result = {
+                    "name": file.name, "total": total_rows, "openings": openings,
+                    "counts": counts, "df": edited_df, "metadata": metadata,
+                    "pdf_bytes": pdf_bytes, "parsed_ok": True,
+                    "sketches": file_sketches,
+                }
+                try:
+                    xl_one = build_combined_workbook([single_result])
+                except Exception:
+                    xl_one = None
+                if xl_one:
+                    st.download_button(
+                        label="📥 Download Excel",
+                        data=xl_one,
+                        file_name=f"{base}_survey.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument."
+                             "spreadsheetml.sheet",
+                        key=f"dlxl_{editor_key}",
+                        use_container_width=True,
+                        help=f"{base}_survey.xlsx",
+                    )
+                else:
+                    st.button("📥 Download Excel", disabled=True,
+                              use_container_width=True,
+                              key=f"dlxl_off_{editor_key}",
+                              help="No exportable rows yet.")
 
     return {
         "name": file.name,
         "total": total_rows,
+        "openings": openings,
         "counts": counts,
         "df": edited_df,
         "metadata": metadata,
@@ -1033,10 +1337,10 @@ def build_combined_workbook(results: list[dict[str, Any]]) -> bytes | None:
             "Customer":            _safe(md.get("customer_name")),
             "Quote No.":           _safe(md.get("quote_number")),
             "Order Date":          _safe(md.get("date")),
-            "Openings":            r["total"],
+            "Openings":            r.get("openings", r["total"]),
+            "Rows":                r["total"],
             "OK":                  counts.get("ok", 0),
-            "Warn":                counts.get("warn", 0),
-            "Danger":              counts.get("danger", 0),
+            "Out of Tolerance":    counts.get("warn", 0) + counts.get("danger", 0),
             "Not Measured":        counts.get("empty", 0),
             "Survey Completion %": round(completion * 100, 1),
         })
@@ -1060,8 +1364,17 @@ def build_combined_workbook(results: list[dict[str, Any]]) -> bytes | None:
         for r, sheet_name in zip(exportable, sheet_names):
             df: pd.DataFrame = r["df"].copy()
 
-            # Order the columns for readability
-            preferred = [c for c in EXPECTED_COLS if c in df.columns]
+            # Order the columns for readability. Include the six measurement
+            # columns (when present and populated) so the workbook is a full
+            # record of how the production size was derived.
+            has_meas = any(
+                c in df.columns and df[c].notna().any() for c in MEASURE_COLUMNS
+            )
+            cols = list(EXPECTED_COLS)
+            if has_meas:
+                insert_at = cols.index("survey_width")
+                cols = cols[:insert_at] + list(MEASURE_COLUMNS) + cols[insert_at:]
+            preferred = [c for c in cols if c in df.columns]
             df = df[preferred]
 
             # Recompute status column against the latest edits
@@ -1232,11 +1545,13 @@ def render_empty_state() -> None:
 # Uploader + Footer
 # =============================================================================
 def render_uploader():
+    # Single order at a time (hard limit) — one PDF fills the page so the grid
+    # is maximised without a fullscreen button.
     return st.file_uploader(
-        label="📤 Upload order PDF(s)",
+        label="📤 Upload order PDF",
         type=["pdf"],
-        accept_multiple_files=True,
-        help="You can select multiple PDFs. Only .pdf files are accepted.",
+        accept_multiple_files=False,
+        help="One order at a time. Only .pdf files are accepted.",
         key="wcs_pdf_uploader",
         label_visibility="visible",
     )
@@ -1254,6 +1569,36 @@ def render_footer():
 # =============================================================================
 # Main
 # =============================================================================
+def arm_unsaved_warning(has_unsaved: bool) -> None:
+    """
+    Browser-level "Leave site?" prompt on refresh / tab close.
+
+    Survey edits and sketches live in st.session_state only — refreshing the
+    browser starts a new Streamlit session and loses them. This arms the
+    native beforeunload prompt whenever there is work worth losing. The
+    listener is installed once on the parent window and just re-flagged each
+    rerun, so it never stacks. Wording is browser-controlled and cannot be
+    customised; the prompt also won't fire until the user has interacted with
+    the page, which is fine — anyone with work has interacted.
+    """
+    flag = "true" if has_unsaved else "false"
+    components.html(
+        f"""<script>
+        (function () {{
+          var w = window.parent;
+          if (!w.__wcsGuardInstalled) {{
+            w.__wcsGuardInstalled = true;
+            w.addEventListener("beforeunload", function (e) {{
+              if (w.__wcsDirty) {{ e.preventDefault(); e.returnValue = ""; return ""; }}
+            }});
+          }}
+          w.__wcsDirty = {flag};
+        }})();
+        </script>""",
+        height=0,
+    )
+
+
 def main() -> None:
     render_sidebar()
     render_header()
@@ -1263,22 +1608,20 @@ def main() -> None:
     # before the heavy per-file UI, so the modal paints instantly.
     sketch.render_sketch_dialog_if_open()
 
-    uploaded = render_uploader()
+    uploaded = render_uploader()   # a single file (or None) — one order at a time
 
     if not uploaded:
+        arm_unsaved_warning(False)
         render_empty_state()
         render_footer()
         return
 
-    # ---- Loop through uploaded files --------------------------------------
-    results: list[dict[str, Any]] = []
-    for idx, file in enumerate(uploaded):
-        results.append(process_file(file, idx))
+    # Work is in progress the moment an order is open — warn before refresh.
+    arm_unsaved_warning(True)
 
-    # ---- Aggregate summary + Excel export — collapsed, out of the grid's way
-    with st.expander("📈 Overall progress & export (all files)", expanded=False):
-        render_aggregate(results)
-        render_excel_export(results)
+    # One order, full-width. The PDF + Excel download buttons live inline at the
+    # bottom of the order (no separate combined-export section needed).
+    process_file(uploaded, 0)
 
     render_footer()
 
