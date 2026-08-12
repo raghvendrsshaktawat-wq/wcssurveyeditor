@@ -11,7 +11,7 @@
 # Tracked upstream at streamlit/streamlit issue #16341.
 # Remove this pin only after Streamlit ships a fix.
 
-streamlit>=1.53,<1.63
+streamlit>=1.53,<1.62
 starlette<1.4
 pymupdf>=1.24.0
 pandas>=2.2.0
