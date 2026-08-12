@@ -74,8 +74,10 @@ def get_tolerance(order_value: Number, survey_value: Number) -> Status:
 
     if delta < OK_MAX_MM:
         return "ok"
-    if delta < WARN_MAX_MM:
-        return "warn"
+    # Single-indication policy (Aug-2026): any deviation >= 75 mm is flagged
+    # red. The amber/"warn" band was retired at the user's request, so the
+    # 75-200 mm range now returns "danger" too. WARN_MAX_MM is kept only for
+    # the legacy classify_tolerance() shim below.
     return "danger"
 
 
