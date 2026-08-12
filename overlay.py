@@ -80,7 +80,7 @@ __version__ = "3.2.0"
 # Matches app.py: white fill, border AND text both colored per status.
 STATUS_COLORS: dict[str, tuple[float, float, float]] = {
     "ok":     (0.0,  0.6,  0.2),    # green
-    "warn":   (0.8,  0.5,  0.0),    # amber
+    "warn":   (0.91, 0.13, 0.18),   # red — amber retired (single-indication)
     "danger": (0.91, 0.13, 0.18),   # red   — Fenesta Red #E8212E
     "empty":  (0.0,  0.36, 0.67),   # blue  — Fenesta Blue #005BAC
 }
@@ -164,11 +164,24 @@ def overlay_survey_data(
         raise TypeError("overlay_survey_data: rows must be a list of dicts.")
     surveyor_name = (surveyor_name or "").strip()
 
-    # Build lookup: sales_line -> row dict
+    facets_by_sales_line: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        if not (isinstance(r, dict) and r.get("sales_line")):
+            continue
+        code = str(r.get("sales_line", "")).strip()
+        facets_by_sales_line.setdefault(code, []).append(r)
+
+    def _fno_sort(x: dict[str, Any]) -> float:
+        try:
+            return float(x.get("facet_no") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    for code, group in facets_by_sales_line.items():
+        group.sort(key=_fno_sort)
+
     by_sales_line: dict[str, dict[str, Any]] = {
-        str(r.get("sales_line", "")).strip(): r
-        for r in rows
-        if isinstance(r, dict) and r.get("sales_line")
+        code: group[0] for code, group in facets_by_sales_line.items()
     }
 
     try:
@@ -189,7 +202,7 @@ def overlay_survey_data(
         # ---- (2) Per-row overlays ------------------------------------------
         for page_index in range(len(doc)):
             page = doc[page_index]
-            _annotate_page(page, by_sales_line)
+            _annotate_page(page, by_sales_line, facets_by_sales_line)
 
         # ---- (3) Site sketches, stamped inline on each item page ------------
         if sketches:
@@ -235,22 +248,25 @@ def _stamp_surveyor_name(page: fitz.Page, name: str) -> None:
     )
 
 
-def _annotate_page(page: fitz.Page, by_sales_line: dict[str, dict[str, Any]]) -> None:
+def _annotate_page(
+    page: fitz.Page,
+    by_sales_line: dict[str, dict[str, Any]],
+    facets_by_sales_line: dict[str, list[dict[str, Any]]] | None = None,
+) -> None:
     """Find each "Aperture Size" anchor and stamp the matching sales-line."""
     anchor_hits = page.search_for(CELL_ANCHOR_LABEL)
     if not anchor_hits:
         return
     sales_line_rects = _find_sales_line_rects_on_page(page, by_sales_line.keys())
-
-    # Precompute the page's horizontal ruling lines once (matches app.py's
-    # per-page h_lines pass) instead of re-scanning get_drawings() per row.
     h_lines = _find_horizontal_rules(page)
 
     for anchor_rect in anchor_hits:
         row = _pick_row_for_anchor(anchor_rect, sales_line_rects, by_sales_line)
         if row is None:
             continue
-        _draw_row_overlay(page, anchor_rect, row, h_lines)
+        code = str(row.get("sales_line") or "").strip()
+        facets = (facets_by_sales_line or {}).get(code) or [row]
+        _draw_row_overlay(page, anchor_rect, facets, h_lines)
 
 
 def _find_sales_line_rects_on_page(
@@ -283,7 +299,7 @@ def _pick_row_for_anchor(
 def _draw_row_overlay(
     page: fitz.Page,
     anchor_rect: fitz.Rect,
-    row: dict[str, Any],
+    facets: list[dict[str, Any]],
     h_lines: list[fitz.Rect],
 ) -> None:
     """Draw the coloured cell + text for one survey row against its anchor.
@@ -293,18 +309,23 @@ def _draw_row_overlay(
     cell with the SAME height, same styling, no label prefix — matching
     app.py's "Production Size row" behaviour exactly.
     """
+    row = facets[0]
+    is_multi = len(facets) > 1
+
     cell_top, cell_bot = _find_cell_bounds(anchor_rect, h_lines)
 
-    # 🩹 v3.1: enforce minimum cell height so text always has room to render
     if (cell_bot - cell_top) < MIN_MAIN_CELL_HEIGHT:
         cell_bot = cell_top + MIN_MAIN_CELL_HEIGHT
 
     row_h = cell_bot - cell_top
 
-    status = row_tolerance(
-        row.get("order_width"), row.get("order_height"),
-        row.get("survey_width"), row.get("survey_height"),
-    )
+    if is_multi:
+        status = _aggregate_status(facets)
+    else:
+        status = row_tolerance(
+            row.get("order_width"), row.get("order_height"),
+            row.get("survey_width"), row.get("survey_height"),
+        )
     color = STATUS_COLORS.get(status, STATUS_COLORS["empty"])
 
     # ---- Main "Aperture Size" cell: white fill, colored border + text -----
@@ -316,7 +337,7 @@ def _draw_row_overlay(
     )
     page.draw_rect(main_cell, color=color, fill=WHITE, width=1.5, overlay=True)
 
-    text = _format_survey_text(row)
+    text = _format_facet_text(facets) if is_multi else _format_survey_text(row)
     _insert_single_line(
         page, main_cell, text=text, row_h=row_h,
         fontname=FONT_NAME, color=color, align="left",
@@ -325,21 +346,49 @@ def _draw_row_overlay(
     # ---- Remarks row: directly below, SAME height, no gap, no label ------
     # (mirrors app.py's "Production Size row" — plain remark text, same
     # color as the status, same left-aligned layout as the main cell)
-    remarks = str(row.get("remarks", "") or "").strip()
+    # Boxes stack downward from the main cell: remarks first (if any), then a
+    # raw-measurements box (three-measurement openings only). next_top tracks
+    # where the next box goes so they never overlap.
+    next_top = cell_bot
+
+    if is_multi:
+        remarks = ""
+        for _f in facets:
+            _rr = str(_f.get("remarks", "") or "").strip()
+            if _rr:
+                remarks = _rr
+                break
+    else:
+        remarks = str(row.get("remarks", "") or "").strip()
     if remarks:
-        rem_top = cell_bot
-        rem_bot = cell_bot + row_h
         rem_cell = fitz.Rect(
             CELL_X_LEFT + CELL_INSET,
-            rem_top + CELL_INSET,
+            next_top + CELL_INSET,
             CELL_X_RIGHT - CELL_INSET,
-            rem_bot - CELL_INSET,
+            next_top + row_h - CELL_INSET,
         )
         page.draw_rect(rem_cell, color=color, fill=WHITE, width=1.5, overlay=True)
         _insert_single_line(
             page, rem_cell, text=remarks, row_h=row_h,
             fontname=FONT_NAME, color=color, align="left",
         )
+        next_top += row_h
+
+    # ---- Raw measurements box (three-measurement mode only) --------------
+    meas_text = _format_measurements(facets)
+    if meas_text:
+        meas_cell = fitz.Rect(
+            CELL_X_LEFT + CELL_INSET,
+            next_top + CELL_INSET,
+            CELL_X_RIGHT - CELL_INSET,
+            next_top + row_h - CELL_INSET,
+        )
+        page.draw_rect(meas_cell, color=color, fill=WHITE, width=1.5, overlay=True)
+        _insert_single_line(
+            page, meas_cell, text=meas_text, row_h=row_h,
+            fontname=FONT_NAME, color=color, align="left",
+        )
+        next_top += row_h
 
 
 def _find_horizontal_rules(page: fitz.Page) -> list[fitz.Rect]:
@@ -384,6 +433,33 @@ def _find_cell_bounds(
 
 # ---- Text helpers -----------------------------------------------------------
 
+def _format_measurements(facets: list[dict[str, Any]]) -> str:
+    """
+    One-line raw-measurement string for three-measurement openings, e.g.
+        "W: 1204/1200/1207   H: 1502/1500/1499"
+    Returns "" when no measurement columns are populated (direct-entry mode),
+    so the extra box is only drawn when there is something to show.
+    For a multi-facet opening, the first facet that carries measurements wins.
+    """
+    def _num(v: Any) -> Optional[int]:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        if f != f:                     # NaN
+            return None
+        return int(round(f))
+
+    for f in facets:
+        ws = [_num(f.get(c)) for c in ("meas_w1", "meas_w2", "meas_w3")]
+        hs = [_num(f.get(c)) for c in ("meas_h1", "meas_h2", "meas_h3")]
+        if any(v is not None for v in ws + hs):
+            w_txt = "/".join(str(v) if v is not None else "-" for v in ws)
+            h_txt = "/".join(str(v) if v is not None else "-" for v in hs)
+            return f"W: {w_txt}   H: {h_txt}"
+    return ""
+
+
 def _format_survey_text(row: dict[str, Any]) -> str:
     """
     Build the '{room} : {surveyed_W} x {surveyed_H}' string.
@@ -419,6 +495,58 @@ def _format_survey_text(row: dict[str, Any]) -> str:
         size_txt = "Not surveyed"
 
     return f"{room} : {size_txt}" if room else size_txt
+
+
+def _aggregate_status(facets: list[dict[str, Any]]) -> str:
+    order = {"danger": 3, "warn": 2, "ok": 1, "empty": 0}
+    worst = "empty"
+    for f in facets:
+        s = row_tolerance(
+            f.get("order_width"), f.get("order_height"),
+            f.get("survey_width"), f.get("survey_height"),
+        )
+        if order.get(s, 0) > order.get(worst, 0):
+            worst = s
+    return worst
+
+
+def _format_facet_text(facets: list[dict[str, Any]]) -> str:
+    def _has_value(v: Any) -> bool:
+        if v is None:
+            return False
+        try:
+            import math as _math
+            return not _math.isnan(float(v))
+        except (TypeError, ValueError):
+            return False
+
+    def _fmt(v: Any) -> str:
+        return str(int(round(float(v))))
+
+    def _pair(sw: Any, sh: Any) -> str:
+        if _has_value(sw) and _has_value(sh):
+            return f"{_fmt(sw)} x {_fmt(sh)}"
+        if _has_value(sw):
+            return f"{_fmt(sw)} x --"
+        if _has_value(sh):
+            return f"-- x {_fmt(sh)}"
+        return "-- x --"
+
+    def _fno(v: Any, default: int) -> int:
+        try:
+            return int(float(v))
+        except (TypeError, ValueError):
+            return default
+
+    first = facets[0]
+    label = (str(first.get("room", "") or "").strip()
+             or str(first.get("location", "") or "").strip())
+    parts = []
+    for idx, f in enumerate(facets, start=1):
+        no = _fno(f.get("facet_no"), idx)
+        parts.append(f"Facet {no}: {_pair(f.get('survey_width'), f.get('survey_height'))}")
+    body = ", ".join(parts)
+    return f"{label} - {body}" if label else body
 
 
 def _insert_single_line(
