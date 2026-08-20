@@ -273,10 +273,27 @@ def _find_sales_line_rects_on_page(
     page: fitz.Page,
     known_sales_lines: Iterable[str],
 ) -> list[tuple[str, fitz.Rect]]:
+    """
+    Locate each sales-line code on the page as a WHOLE WORD.
+
+    CRITICAL FIX (20-Aug-2026): the previous implementation used
+    page.search_for(code), which does SUBSTRING matching. A 4-digit
+    sales-line code such as "0011" is a substring of the 10-digit MSC number
+    printed in every page header (e.g. 9001172578 contains "0011"), so a
+    sketch for line 0011 matched the header on page 1 and was stamped on the
+    wrong line. Matching whole word tokens instead — the sales line is its own
+    space-delimited token, the MSC number is a different token — eliminates
+    that false positive entirely. One pass over the page's words also replaces
+    N search_for() calls, so it is faster too.
+    """
+    wanted = {str(c).strip() for c in known_sales_lines if str(c).strip()}
+    if not wanted:
+        return []
     found: list[tuple[str, fitz.Rect]] = []
-    for code in known_sales_lines:
-        for rect in page.search_for(code):
-            found.append((code, rect))
+    for w in page.get_text("words"):
+        token = str(w[4]).strip()
+        if token in wanted:
+            found.append((token, fitz.Rect(w[0], w[1], w[2], w[3])))
     return found
 
 
